@@ -59,6 +59,155 @@ app.MapGet("/classes/{id}", async (string id, NpgsqlDataSource db) =>
         : Results.Ok(ToDto(row));
 });
 
+var holdSeconds = int.TryParse(app.Configuration["HOLD_DURATION_SECONDS"], out var hs) && hs > 0 ? hs : 600;
+
+const string HoldSelect = @"
+SELECT h.id, h.class_id, h.student_id, c.name AS class_name,
+  CASE WHEN h.status = 'HELD' AND h.expires_at <= now() THEN 'EXPIRED' ELSE h.status END AS status,
+  h.expires_at
+FROM holds h JOIN classes c ON c.id = h.class_id";
+
+static string? StudentId(HttpRequest r)
+{
+    var v = r.Headers["X-Student-Id"].ToString().Trim();
+    return System.Text.RegularExpressions.Regex.IsMatch(v, @"^\d{17}$") ? v : null;
+}
+
+static string Iso(DateTime d) => d.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
+
+static IResult BadStudent() =>
+    Results.BadRequest(new { error = "X-Student-Id header must be a 17-digit birth registration number." });
+
+// 4. Apply (seat hold)
+app.MapPost("/classes/{classId}/holds", async (string classId, HttpRequest req, NpgsqlDataSource db) =>
+{
+    var student = StudentId(req);
+    if (student is null) return BadStudent();
+
+    await using var conn = await db.OpenConnectionAsync();
+    await using var tx = await conn.BeginTransactionAsync();
+
+    // class row lock: ek class-e ekshathe onek request ashleo ek ek kore cholbe
+    var total = await conn.QuerySingleOrDefaultAsync<int?>(
+        "SELECT total_seats FROM classes WHERE id = @classId FOR UPDATE", new { classId }, tx);
+    if (total is null) return Results.NotFound(new { error = "Class not found." });
+
+    await conn.ExecuteAsync(
+        "UPDATE holds SET status = 'EXPIRED' WHERE class_id = @classId AND status = 'HELD' AND expires_at <= now()",
+        new { classId }, tx);
+
+    var already = await conn.ExecuteScalarAsync<long>(
+        "SELECT COUNT(*) FROM holds WHERE class_id = @classId AND student_id = @student AND status IN ('HELD','CONFIRMED')",
+        new { classId, student }, tx);
+    if (already > 0)
+        return Results.Conflict(new { error = "You already have an active application for this class." });
+
+    var taken = await conn.ExecuteScalarAsync<long>(
+        "SELECT COUNT(*) FROM holds WHERE class_id = @classId AND status IN ('HELD','CONFIRMED')",
+        new { classId }, tx);
+    if (taken >= total.Value)
+        return Results.Conflict(new { error = "No seats available in this class." });
+
+    var holdId = "h_" + Guid.NewGuid().ToString("N")[..8];
+    var expiresAt = await conn.QuerySingleAsync<DateTime>(
+        @"INSERT INTO holds (id, class_id, student_id, status, expires_at)
+          VALUES (@holdId, @classId, @student, 'HELD', now() + make_interval(secs => @secs))
+          RETURNING expires_at",
+        new { holdId, classId, student, secs = (double)holdSeconds }, tx);
+    await tx.CommitAsync();
+
+    return Results.Created($"/holds/{holdId}",
+        new { holdId, classId, studentId = student, status = "HELD", expiresAt = Iso(expiresAt) });
+});
+
+// 5. Ekta hold-er obostha
+app.MapGet("/holds/{holdId}", async (string holdId, NpgsqlDataSource db) =>
+{
+    await using var conn = await db.OpenConnectionAsync();
+    var row = await conn.QuerySingleOrDefaultAsync<HoldRow>(HoldSelect + " WHERE h.id = @holdId", new { holdId });
+    return row is null
+        ? Results.NotFound(new { error = "Application not found." })
+        : Results.Ok(new { holdId = row.Id, classId = row.ClassId, status = row.Status, expiresAt = Iso(row.ExpiresAt) });
+});
+
+// 6. Confirm (fee joma)
+app.MapPost("/holds/{holdId}/confirm", async (string holdId, HttpRequest req, NpgsqlDataSource db) =>
+{
+    var student = StudentId(req);
+    if (student is null) return BadStudent();
+
+    await using var conn = await db.OpenConnectionAsync();
+    await using var tx = await conn.BeginTransactionAsync();
+    var row = await conn.QuerySingleOrDefaultAsync<HoldRow>(
+        "SELECT id, class_id, student_id, status, expires_at, (expires_at <= now()) AS is_expired FROM holds WHERE id = @holdId FOR UPDATE",
+        new { holdId }, tx);
+
+    if (row is null) return Results.NotFound(new { error = "Application not found." });
+    if (row.StudentId != student)
+        return Results.Json(new { error = "This application belongs to another student." }, statusCode: 403);
+    if (row.Status == "CONFIRMED")
+        return Results.Ok(new { holdId, status = "CONFIRMED" }); // abar confirm korleo seat ek-i thakbe
+
+    if (row.Status == "HELD" && !row.IsExpired)
+    {
+        await conn.ExecuteAsync("UPDATE holds SET status = 'CONFIRMED' WHERE id = @holdId", new { holdId }, tx);
+        await tx.CommitAsync();
+        return Results.Ok(new { holdId, status = "CONFIRMED" });
+    }
+
+    if (row.Status == "HELD")
+    {
+        await conn.ExecuteAsync("UPDATE holds SET status = 'EXPIRED' WHERE id = @holdId", new { holdId }, tx);
+        await tx.CommitAsync();
+    }
+    return Results.Conflict(new { error = "This application has expired or was cancelled, so it cannot be confirmed." });
+});
+
+// 7. Cancel
+app.MapDelete("/holds/{holdId}", async (string holdId, HttpRequest req, NpgsqlDataSource db) =>
+{
+    var student = StudentId(req);
+    if (student is null) return BadStudent();
+
+    await using var conn = await db.OpenConnectionAsync();
+    await using var tx = await conn.BeginTransactionAsync();
+    var row = await conn.QuerySingleOrDefaultAsync<HoldRow>(
+        "SELECT id, class_id, student_id, status, expires_at FROM holds WHERE id = @holdId FOR UPDATE",
+        new { holdId }, tx);
+
+    if (row is null) return Results.NotFound(new { error = "Application not found." });
+    if (row.StudentId != student)
+        return Results.Json(new { error = "This application belongs to another student." }, statusCode: 403);
+    if (row.Status == "CONFIRMED")
+        return Results.Conflict(new { error = "A confirmed admission cannot be cancelled." });
+
+    if (row.Status == "HELD")
+    {
+        await conn.ExecuteAsync("UPDATE holds SET status = 'CANCELLED' WHERE id = @holdId", new { holdId }, tx);
+        await tx.CommitAsync();
+    }
+    return Results.NoContent();
+});
+
+// 8. Ei student-er sob abedon
+app.MapGet("/me/holds", async (HttpRequest req, NpgsqlDataSource db) =>
+{
+    var student = StudentId(req);
+    if (student is null) return BadStudent();
+
+    await using var conn = await db.OpenConnectionAsync();
+    var rows = await conn.QueryAsync<HoldRow>(
+        HoldSelect + " WHERE h.student_id = @student ORDER BY h.created_at DESC", new { student });
+    return Results.Ok(rows.Select(r => new
+    {
+        holdId = r.Id,
+        classId = r.ClassId,
+        className = r.ClassName,
+        status = r.Status,
+        expiresAt = Iso(r.ExpiresAt)
+    }));
+});
+
 app.Run();
 
 static object ToDto(ClassRow c) => new
@@ -113,6 +262,17 @@ public class ClassRow
     public int TotalSeats { get; set; }
     public long HeldSeats { get; set; }
     public long ConfirmedSeats { get; set; }
+}
+
+public class HoldRow
+{
+    public string Id { get; set; } = "";
+    public string ClassId { get; set; } = "";
+    public string StudentId { get; set; } = "";
+    public string ClassName { get; set; } = "";
+    public string Status { get; set; } = "";
+    public DateTime ExpiresAt { get; set; }
+    public bool IsExpired { get; set; }
 }
 
 public record CreateClassRequest(string? Name, int? TotalSeats);
