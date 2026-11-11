@@ -5,6 +5,8 @@ DefaultTypeMap.MatchNamesWithUnderscores = true;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.UseUrls("http://localhost:8080");
+
 var connectionString = builder.Configuration["DB_CONNECTION"]
     ?? "Host=localhost;Port=5433;Database=admission;Username=postgres;Password=postgres";
 var dataSource = NpgsqlDataSource.Create(connectionString);

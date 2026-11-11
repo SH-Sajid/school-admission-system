@@ -4,4 +4,4 @@ obj/
 node_modules/
 dist/
 .vs/
-.env
+config.bat
